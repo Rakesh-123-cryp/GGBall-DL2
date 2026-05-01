@@ -396,10 +396,36 @@ class PoincareFeedForward(nn.Module):
         
         return x
 
+class ClassEmbedder(nn.Module):
 
+    def __init__(self, num_classes: int, hidden_size: int, dropout_prob: float = 0.1):
+        super().__init__()
+        self.num_classes    = num_classes
+        self.dropout_prob   = dropout_prob
+        # +1 for the null / unconditional token
+        self.embedding = nn.Embedding(num_classes + 1, hidden_size)
+        self.null_class_idx = num_classes          # index of the ∅ token
+
+    def token_drop(self, labels: torch.Tensor) -> torch.Tensor:
+        """Randomly replace labels with the null token during training."""
+        drop_mask = torch.rand(labels.shape[0], device=labels.device) < self.dropout_prob
+        null_labels = torch.full_like(labels, self.null_class_idx)
+        return torch.where(drop_mask, null_labels, labels)
+
+    def forward(self, labels: torch.Tensor, train: bool = False) -> torch.Tensor:
+        
+        if train:
+            labels = self.token_drop(labels)
+        return self.embedding(labels)          # (B, hidden_size)
+    
 class TimedPoincareTransformer(nn.Module):
-    def __init__(self, cfg, manifold, in_channels, num_layers, num_heads, dropout, max_seq_len, use_hyperbolic_attention, attention_type, attention_activation):
-        super(TimedPoincareTransformer, self).__init__()
+    def __init__(self, cfg, manifold, in_channels, num_layers, num_heads, dropout,
+                 max_seq_len, use_hyperbolic_attention, attention_type,
+                 attention_activation,
+                 num_classes: int = 0,          
+                 cfg_dropout: float = 0.1):     
+        super().__init__()
+
         self.cfg = cfg
         self.manifold = manifold
         self.model_dim = in_channels
@@ -409,22 +435,24 @@ class TimedPoincareTransformer(nn.Module):
         self.head_dim = self.model_dim // self.num_heads
         self.max_seq_len = max_seq_len
         self.use_hyperbolic_attention = use_hyperbolic_attention
-        self.attention_type = attention_type  # 'distance' or 'inner_product'
-        self.attention_activation = attention_activation  # 'exp', 'sigmoid', or 'identity'
+        self.attention_type = attention_type
+        self.attention_activation = attention_activation
 
-        # Time embedding
         self.t_embedder = TimestepEmbedder(self.model_dim, manifold)
-        
-        # Positional embedding
+        self.num_classes = num_classes
+        if num_classes > 0:
+            self.class_embedder = ClassEmbedder(num_classes, self.model_dim,
+                                                dropout_prob=cfg_dropout)
+        else:
+            self.class_embedder = None
+
         self.pos_embedding = PoincareLearnedPositionalEmbedding(
             num_embeddings=self.max_seq_len,
             embedding_dim=self.model_dim,
             padding_idx=0,
             ball=self.manifold
-            # requires_grad=True
         )
-        
-        # Transformer layers
+
         self.layers = nn.ModuleList([
             TimedPoincareTransformerLayer(
                 model_dim=self.model_dim,
@@ -436,43 +464,35 @@ class TimedPoincareTransformer(nn.Module):
                 attention_activation=self.attention_activation
             ) for _ in range(self.num_layers)
         ])
-        
-        # Output projection
+
         self.output_projection = PoincareLinear(
             manifold=self.manifold,
             in_dim=self.model_dim,
             out_dim=self.model_dim,
             bias=True
         )
-        
-    def forward(self, t, x, mask=None):
+
+    def forward(self, t, x, condition=None, mask=None):
         """
         Args:
-            t: Time tensor of shape [batch_size]
-            x: Input tensor of shape [batch_size, seq_len, model_dim]
-            mask: Optional mask tensor of shape [batch_size, seq_len]
-        
-        Returns:
-            Output tensor of shape [batch_size, seq_len, model_dim]
+            t:         (B, 1)  time
+            x:         (B, N, D)  noisy latents
+            condition: (B,) integer class labels, or None
+            mask:      (B, N) node mask
         """
-        # Get time embedding
+        # ── Time embedding ────────────────────────────────────────────────────
+        t_emb = self.t_embedder(t)                     # (B, D)
 
-        t_emb = self.t_embedder(t)
-        
-        # Get positions
+        if self.class_embedder is not None and condition is not None:
+            c_emb = self.class_embedder(condition,
+                                        train=self.training)  # (B, D)
+            t_emb = t_emb + c_emb
+        # If condition is None we fall back to unconditional behaviour
+
         positions = torch.arange(x.size(1), device=x.device).unsqueeze(0)
-        
-        # Add positional embeddings
         pos_emb = self.pos_embedding(positions)
-        
-        # Mobius addition of input and positional embeddings
         x = self.manifold.mobius_add(x, pos_emb)
-        
-        # Apply transformer layers with time embedding
         for layer in self.layers:
             x = layer(x, t_emb, mask)
-        
-        # Apply output projection
-        x = self.output_projection(x)
-        
-        return x 
+
+        return self.output_projection(x)

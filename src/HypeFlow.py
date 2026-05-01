@@ -69,13 +69,22 @@ def output_and_div(vecfield, x, v=None, div_mode="exact"):
 
 
 class ManifoldFMLitModule(pl.LightningModule):
-    def __init__(self, cfg, sampling_metrics, glob_cfg):
+    def __init__(self, cfg, sampling_metrics, glob_cfg,
+                 dataset_bins=None,
+                 condition_prop_idx=None):
         super().__init__()
         self.cfg = cfg
         self.glob_cfg = glob_cfg
         self.manifold_name = cfg.model.manifold
         self.manifold = eval(self.manifold_name)()
 
+        # COND
+        self.condition_prop_idx = condition_prop_idx
+        if dataset_bins is not None:
+            self.register_buffer("dataset_bins", dataset_bins)
+        else:
+            self.dataset_bins = None
+            
         # Model of the vector field.
         # self.model = HypAttention(cfg)
         self.shuffle_dense_graph = glob_cfg.model.shuffle_dense_graph
@@ -93,10 +102,16 @@ class ManifoldFMLitModule(pl.LightningModule):
                 (Euclidean(), self.euc_channels), (self.manifold, self.hyp_channels)
             )
         
-        if self.glob_cfg.dataset.name in ['hyperbolic'] or self.euc_channels==0 :
+        if self.glob_cfg.dataset.name in ['hyperbolic'] or self.euc_channels == 0:
             from .models.hyperbolic_nn_plusplus.geoopt_plusplus.manifolds import PoincareBall
-            self.model = TimedPoincareTransformer(cfg, PoincareBall(), glob_cfg.model.latent_channels, glob_cfg.model.transformer_encoder.trans_num_layers, glob_cfg.model.transformer_encoder.trans_num_heads, glob_cfg.model.transformer_encoder.trans_dropout, 
-                                                  glob_cfg.model.transformer_encoder.max_seq_len, glob_cfg.model.transformer_encoder.use_hyperbolic_attention, glob_cfg.model.transformer_encoder.attention_type, glob_cfg.model.transformer_encoder.attention_activation)
+
+            num_classes  = getattr(self.glob_cfg.dataset, 'num_classes',  0)
+            cfg_dropout  = getattr(self.glob_cfg.model,   'cfg_dropout',  0.1)
+
+            self.model = TimedPoincareTransformer(
+                cfg, PoincareBall(), glob_cfg.model.latent_channels, glob_cfg.model.transformer_encoder.trans_num_layers, glob_cfg.model.transformer_encoder.trans_num_heads, glob_cfg.model.transformer_encoder.trans_dropout, 
+                glob_cfg.model.transformer_encoder.max_seq_len, glob_cfg.model.transformer_encoder.use_hyperbolic_attention, glob_cfg.model.transformer_encoder.attention_type, glob_cfg.model.transformer_encoder.attention_activation, num_classes=num_classes, cfg_dropout=cfg_dropout)
+
         else:
             self.model = DiTAttention(cfg, self.product_manifold)
 
@@ -306,83 +321,94 @@ class ManifoldFMLitModule(pl.LightningModule):
         return graph_list, graph_list_argmax
 
     @torch.no_grad()
-    def sample(self, n_samples, x0=None):
+    def sample(self, n_samples, x0=None, condition=None,
+           guidance_scale: float = 3.0, zero_init_steps: int = 1):
         if x0 is None:
-            # Sample from base distribution.
-            max_nodes = self.dataset_infos.n_nodes.shape[-1] # may be we need max_node = max_nodes - 1
-            num_masked_tokens = torch.multinomial(self.dataset_infos.n_nodes, num_samples=n_samples, replacement=True)
+            max_nodes = self.dataset_infos.n_nodes.shape[-1]
+            num_masked_tokens = torch.multinomial(
+                self.dataset_infos.n_nodes, num_samples=n_samples, replacement=True
+            )
             mask = torch.zeros((n_samples, max_nodes), device=self.device, dtype=torch.int64)
             for i, n in enumerate(num_masked_tokens):
                 mask[i, :n] = 1
-            # mask = mask.float()
-            # x0 = self.product_manifold.random((n_samples, max_nodes, self.hyp_channels+self.euc_channels), device=self.device, std=self.prior_std)
-            # pdb.set_trace()
-            # if self.VAE.model.hyp_codebook is not None:
-            #     hyp_indices = torch.randint(0, self.VAE.model.hyp_codebook.codebook.shape[0], (n_samples, max_nodes), device=self.device)
-            #     x0 = F.embedding(hyp_indices, self.VAE.model.hyp_codebook.codebook)
-            # else:
-            #     x0 = self.product_manifold.random((n_samples, max_nodes, self.hyp_channels+self.euc_channels), device=self.device, std=self.prior_std)
-            x0 = self.product_manifold.random((n_samples, max_nodes, self.hyp_channels+self.euc_channels), device=self.device, std=self.prior_std)
-            
+
+            x0 = self.product_manifold.random(
+                (n_samples, max_nodes, self.hyp_channels + self.euc_channels),
+                device=self.device, std=self.prior_std
+            )
+
+        use_cfg = (
+            condition is not None
+            and self.model.class_embedder is not None
+            and guidance_scale != 1.0
+        )
+
+        if use_cfg:
+            null_condition = torch.full(
+                (n_samples,),
+                fill_value=self.model.class_embedder.null_class_idx,
+                device=self.device, dtype=torch.long,
+            )
+
+        # Build the vector field (with or without CFG)
+        def effective_vecfield(t, x, **kwargs):
+            if use_cfg:
+                # Conditional pass
+                v_cond = self.vecfield(t, x, condition=condition, mask=mask)
+                # Unconditional pass
+                v_uncond = self.vecfield(t, x, condition=null_condition, mask=mask)
+                # CFG interpolation in tangent space at x
+                v_cond_tan = self.product_manifold.logmap(x, v_cond)
+                v_uncond_tan = self.product_manifold.logmap(x, v_uncond)
+                v_cfg_tan = v_uncond_tan + guidance_scale * (v_cond_tan - v_uncond_tan)
+                return self.product_manifold.expmap(x, v_cfg_tan)
+            else:
+                return self.vecfield(t, x, condition=condition, mask=mask)
+
         local_coords = self.cfg.get("local_coords", False)
         eval_projx = self.cfg.get("eval_projx", False)
 
-        # Solve ODE.
         if not eval_projx and not local_coords:
-            # If no projection, use adaptive step solver.
             x1 = odeint(
-                self.vecfield,
+                effective_vecfield,
                 x0,
                 t=torch.linspace(0, 1, 2).to(self.device),
                 atol=self.cfg.model.atol,
                 rtol=self.cfg.model.rtol,
                 options={"min_step": 1e-5},
-                node_mask = mask,
             )[-1]
         else:
-            # If projection, use 1000 steps.
             x1 = projx_integrator_return_last(
                 self.product_manifold,
-                self.vecfield,
+                effective_vecfield,
                 x0,
                 t=torch.linspace(0, 1, self.nfe_steps).to(self.device),
                 method=self.cfg.integrate.method,
                 projx=eval_projx,
                 local_coords=local_coords,
                 pbar=True,
-                node_mask = mask,
             )
-            # x1 = projx_integrator_return_last(
-            #     self.product_manifold,
-            #     self.vecfield,
-            #     x0,
-            #     t=torch.linspace(0, 1, self.nfe_steps).to(self.device),
-            #     # method="euler",
-            #     method="x0_pred",
-            #     projx=eval_projx,
-            #     local_coords=local_coords,
-            #     pbar=True,
-            #     node_mask = mask,
-            # )
-        # x1 = self.manifold.projx(x1)
+
         x1_norm = torch.norm(x1, p=2, dim=-1)
         x1_x0_norm = torch.norm(x1 - x0, p=2, dim=-1)
         x_0_norm = torch.norm(x0, p=2, dim=-1)
-        to_log = {"epoch": self.current_epoch}
-        to_log.update({"val/sampled_x1_norm_min": x1_norm.min().item()})
-        to_log.update({"val/sampled_x1_norm_max": x1_norm.max().item()})
-        to_log.update({"val/sampled_x1_norm_mean": x1_norm.mean().item()})
-        to_log.update({"val/sampled_x1_x0_norm_min": x1_x0_norm.min().item()})
-        to_log.update({"val/sampled_x1_x0_norm_max": x1_x0_norm.max().item()})
-        to_log.update({"val/sampled_x1_x0_norm_mean": x1_x0_norm.mean().item()})
-        to_log.update({"val/sampled_x0_norm_min": x_0_norm.min().item()})
-        to_log.update({"val/sampled_x0_norm_max": x_0_norm.max().item()})
-        to_log.update({"val/sampled_x0_norm_mean": x_0_norm.mean().item()})
-        print(f"x1_norm min: {x1_norm.min().item():.4f}, x1_norm max: {x1_norm.max().item():.4f}, x1_norm mean: {x1_norm.mean().item():.4f}")
-        print(f"x1_x0_norm min: {x1_x0_norm.min().item():.4f}, x1_x0_norm max: {x1_x0_norm.max().item():.4f}, x1_x0_norm mean: {x1_x0_norm.mean().item():.4f}")
-        print(f"x_0_norm min: {x_0_norm.min().item():.4f}, x_0_norm max: {x_0_norm.max().item():.4f}, x_0_norm mean: {x_0_norm.mean().item():.4f}")
+        to_log = {
+            "epoch": self.current_epoch,
+            "val/sampled_x1_norm_min": x1_norm.min().item(),
+            "val/sampled_x1_norm_max": x1_norm.max().item(),
+            "val/sampled_x1_norm_mean": x1_norm.mean().item(),
+            "val/sampled_x1_x0_norm_min": x1_x0_norm.min().item(),
+            "val/sampled_x1_x0_norm_max": x1_x0_norm.max().item(),
+            "val/sampled_x1_x0_norm_mean": x1_x0_norm.mean().item(),
+            "val/sampled_x0_norm_min": x_0_norm.min().item(),
+            "val/sampled_x0_norm_max": x_0_norm.max().item(),
+            "val/sampled_x0_norm_mean": x_0_norm.mean().item(),
+        }
+        print(f"x1_norm  min:{x1_norm.min():.4f} max:{x1_norm.max():.4f} mean:{x1_norm.mean():.4f}")
+        print(f"x1-x0    min:{x1_x0_norm.min():.4f} max:{x1_x0_norm.max():.4f} mean:{x1_x0_norm.mean():.4f}")
+        print(f"x0_norm  min:{x_0_norm.min():.4f} max:{x_0_norm.max():.4f} mean:{x_0_norm.mean():.4f}")
         wandb.log(to_log)
-        
+
         return x1, mask
 
     @torch.no_grad()
@@ -512,17 +538,16 @@ class ManifoldFMLitModule(pl.LightningModule):
             traceback.print_exc()
             return torch.zeros(batch.shape[0]).to(batch)
 
-    def loss_fn(self, batch: torch.Tensor):
-        return self.rfm_loss_fn(batch)
+    def loss_fn(self, batch, condition=None):
+        return self.rfm_loss_fn(batch, condition=condition)
 
-    def rfm_loss_fn(self, batch: torch.Tensor):
+    def rfm_loss_fn(self, batch: torch.Tensor, condition=None):
         if self.use_riemannian_optimizer and self.trainer.training:
             opt_euc, opt_hyp = self.optimizers()
             sched_euc, sched_hyp = self.lr_schedulers()
-    
             self.log("lr_euc", sched_euc.get_last_lr()[0], prog_bar=True)
             self.log("lr_hyp", sched_hyp.get_last_lr()[0], prog_bar=False)
-        # import pdb; pdb.set_trace()
+
         if isinstance(batch, dict):
             x0 = batch["x0"]
             x1 = batch["x1"]
@@ -532,161 +557,101 @@ class ManifoldFMLitModule(pl.LightningModule):
             N = x1.shape[0]
             MAX_NODES = x1.shape[1]
             t = torch.rand(N).reshape(-1, 1).to(x1)
-            # unsqueeze(2).repeat(1, MAX_NODES, 1).
+
             def cond_u(x0, x1, t):
                 path = geodesic(self.hyp_manifold, x0, x1)
                 x_t, u_t = jvp(lambda t: path(self.scheduler(t).alpha_t), (t,), (torch.ones_like(t).to(t),))
                 return x_t, u_t
-                    
 
-            # x_t, u_t = cond_u(x0, x1, t)
             x_t, u_t = vmap(cond_u)(x0, x1, t)
             x_t = x_t.reshape(N, MAX_NODES, -1)
             u_t = u_t.reshape(N, MAX_NODES, -1)
 
-            # x_t = self.vecfield(t, x_t).squeeze(0)
-            # v_t = self.manifold.logmap(x0, x_t)
-            x_t_1 = self.vecfield(t, x_t)
+            x_t_1 = self.vecfield(t, x_t, condition=condition)
             v_t = self.manifold.logmap(x_t, x_t_1)
-
             diff = (v_t - u_t).clone().contiguous()
             dim = x_t.shape[-1]
-            # loss = (torch.norm(diff, p=2, dim=-1) ** 2).mean() / dim
-            loss = self.hyp_manifold.inner(x_t.reshape(-1, dim), 
-                                           diff.reshape(-1, dim), 
-                                           diff.reshape(-1, dim)).mean() / dim
+            loss = self.hyp_manifold.inner(
+                x_t.reshape(-1, dim),
+                diff.reshape(-1, dim),
+                diff.reshape(-1, dim)
+            ).mean() / dim
 
-            
         else:
             x1 = batch
             _, node_mask, node_feat, edge_feat = self.encode(x1)
-                    
+
             if self.hyp_channels==0:
                 x1 = node_feat
-            if self.euc_channels==0:
+            elif self.euc_channels==0:
                 x1 = edge_feat
-            if self.hyp_channels>0 and self.euc_channels>0:
+            else:
                 x1 = torch.concat((node_feat, edge_feat), dim=-1)
-            
-            
-            # x0 = self.product_manifold.random(*x1.shape, device=self.device, dtype=x1.dtype, std=self.prior_std).to(x1)
 
-            # 从码本的大小中采一个均匀分布的index, 然后根据这个index从码本中采样一个向量作为x0
-            # pdb.set_trace()
-            # if self.VAE.model.hyp_codebook is not None:
-            #     hyp_indices = torch.randint(0, self.VAE.model.hyp_codebook.codebook.shape[0], (x1.shape[0],x1.shape[1], ), device=self.device)
-            #     x0 = F.embedding(hyp_indices, self.VAE.model.hyp_codebook.codebook)
-            # else:
-            #     x0 = self.product_manifold.random(*x1.shape, device=self.device, dtype=x1.dtype, std=self.prior_std).to(x1)
             x0 = self.product_manifold.random(*x1.shape, device=self.device, dtype=x1.dtype, std=self.prior_std).to(x1)
-            
-            
-            # log distribution of x0
             x0_norm = torch.norm(x0, p=2, dim=-1)
             x1_norm = torch.norm(x1, p=2, dim=-1)
-            print(f"x1_norm min: {x1_norm.min().item():.4f}, x1_norm max: {x1_norm.max().item():.4f}, x1_norm mean: {x1_norm.mean().item():.4f}")
-            print(f"x0_norm min: {x0_norm.min().item():.4f}, x0_norm max: {x0_norm.max().item():.4f}, x0_norm mean: {x0_norm.mean().item():.4f}")
+            print(f"x1_norm min: {x1_norm.min().item():.4f}, max: {x1_norm.max().item():.4f}, mean: {x1_norm.mean().item():.4f}")
+            print(f"x0_norm min: {x0_norm.min().item():.4f}, max: {x0_norm.max().item():.4f}, mean: {x0_norm.mean().item():.4f}")
             to_log = {"epoch": self.current_epoch}
-            to_log.update({"train/x0_norm_min": x0_norm.min().item()})
-            to_log.update({"train/x0_norm_max": x0_norm.max().item()})
-            to_log.update({"train/x0_norm_mean": x0_norm.mean().item()})
-            to_log.update({"train/x1_norm_min": x1_norm.min().item()})
-            to_log.update({"train/x1_norm_max": x1_norm.max().item()})
-            to_log.update({"train/x1_norm_mean": x1_norm.mean().item()})
+            to_log.update({
+                "train/x0_norm_min": x0_norm.min().item(),
+                "train/x0_norm_max": x0_norm.max().item(),
+                "train/x0_norm_mean": x0_norm.mean().item(),
+                "train/x1_norm_min": x1_norm.min().item(),
+                "train/x1_norm_max": x1_norm.max().item(),
+                "train/x1_norm_mean": x1_norm.mean().item(),
+            })
             wandb.log(to_log)
-            # pdb.set_trace()
-            # x0 = self.model.manifold_out.random_normal((x1.size(0), x1.size(1), self.euc_channels), device=self.device)
-            
-            
-            # test_manifold_lorentz = Lorentz(k=float(self.cfg.model.k_out))
-            # ## attention: the fllowing lines is for PoincareBall, so we need to change it to PoincareBall
-            # test_manifold = PoincareBall2(dim= self.cfg.model.in_channels - 1, c = 1/float(self.cfg.model.k_out))  # k = 1/c
-            
-            # _pz_mu = nn.Parameter(torch.zeros(x1.shape[0], x1.shape[1], self.cfg.model.in_channels - 1), requires_grad=False)
-            # _pz_logvar = nn.Parameter(torch.zeros(1, 1), requires_grad=False)
-            
-            # pz = WrappedNormal(_pz_mu.mul(1), F.softplus(_pz_logvar).div(math.log(2)).mul(self.glob_cfg.model.prior_std), test_manifold)
-            # sample_z = pz.rsample().to(x1.device)
-            # # sample_z = test_manifold.random_normal((x.size(0), x.size(1), self.cfg.model.out_channels + 1)).to(x.device)
-            # x0 = test_manifold_lorentz.poincare_to_lorentz(sample_z)
-            # x0 = self.manifold.random_normal(x1.shape).to(x1)
 
             N = x1.shape[0]
             MAX_NODES = x1.shape[1]
             t = torch.rand(N).reshape(-1, 1).to(x1)
-            # unsqueeze(2).repeat(1, MAX_NODES, 1).
+
             def cond_u(x0, x1, t):
                 path = geodesic(self.product_manifold, x0, x1)
-                x_t, u_t = jvp(lambda t: path(self.scheduler(t).alpha_t), (t,), (torch.ones_like(t).to(t),))
+                x_t, u_t = jvp(
+                    lambda t: path(self.scheduler(t).alpha_t),
+                    (t,), (torch.ones_like(t).to(t),)
+                )
                 return x_t, u_t
 
-            # x_t, u_t = cond_u(x0, x1, t)
-            
             x_t, u_t = vmap(cond_u)(x0, x1, t)
             x_t = x_t.reshape(N, MAX_NODES, -1)
             u_t = u_t.reshape(N, MAX_NODES, -1)
             u_t = self.product_manifold.proju(x_t, u_t)
             
-            
-            # # 预测x_t
-            #     x1_pred = self.vecfield(t, x_t, mask=node_mask)
-            # # # we can add a loss, to explicitly enforce the vector field to be tangent to the manifold
-            
-            # # we can also use distance in product manifold
-            #     diff = self.product_manifold.dist(x1_pred, x1)
-            #     loss = (diff * node_mask).sum() / node_mask.sum()
+            x1_pred = self.vecfield(t, x_t, condition=condition, mask=node_mask)
 
-            # diff = v_t - u_t
-            # import pdb; pdb.set_trace()
-            x1_pred = self.vecfield(t, x_t, mask=node_mask)
-            # pdb.set_trace()
-            # x1_pred = self.vecfield(t, x_t,).squeeze(0)
             if self.cfg.integrate.method == "vt_prediction":
                 v_t = self.product_manifold.logmap(x_t, x1_pred)
                 diff = (v_t - u_t).clone().contiguous()
                 dim = x_t.shape[-1]
-                # loss = (torch.norm(diff, p=2, dim=-1) ** 2).mean() / dim
-                
-                # 重塑张量并确保内存连续性
-                # with torch.jit.optimized_execution(False):
+                loss = (
+                    self.product_manifold.inner(
+                        x_t.reshape(-1, dim),
+                        diff.reshape(-1, dim),
+                        diff.reshape(-1, dim),
+                    ) * node_mask.reshape(-1, 1)
+                ).sum() / node_mask.sum() / dim
 
-                loss = (self.product_manifold.inner(x_t.reshape(-1, dim), diff.reshape(-1, dim), 
-                       diff.reshape(-1, dim)) * node_mask.reshape(-1, 1)).sum() / node_mask.sum() / dim
-                # loss = self.product_manifold.inner(x_t.reshape(-1, dim), 
-                #                                     diff.reshape(-1, dim), 
-                #                                     diff.reshape(-1, dim)).mean() / dim
             elif self.cfg.integrate.method == "x1_prediction":
-                diff = self.product_manifold.dist(x1_pred, x1)
-                diff = diff ** 2
+                diff = self.product_manifold.dist(x1_pred, x1) ** 2
                 loss = (diff * node_mask).sum() / node_mask.sum()
 
-            # # import pdb; pdb.set_trace()
-            # x_t_1 = self.product_manifold.expmap(x_t, 0.001 * u_t)
-            # x_t_1_pre = self.product_manifold.expmap(x_t, 0.001 * v_t)
-            # # inner_x =  torch.norm(x_t_1 - x_t_1_pre, p=2, dim=-1) ** 2
-            # # loss_extra = (inner_x * node_mask).mean()
-            # loss_extra =  self.product_manifold.dist(x_t_1, x_t_1_pre)
-            # loss_extra = (loss_extra * node_mask).sum() / x_t_1.shape[0]
-            
-            # loss += loss_extra
         if self.use_riemannian_optimizer and self.trainer.training:
             opt_euc.zero_grad()
             opt_hyp.zero_grad()
             self.manual_backward(loss)
             self.clip_gradients(
                 optimizer=opt_euc,
-                # gradient_clip_val=self.glob_cfg.train.clip_grad,
-                # gradient_clip_algorithm="norm"
                 gradient_clip_val=self.cfg.train.manual_setting.gradient_clip_val,
-                gradient_clip_algorithm=self.cfg.train.manual_setting.gradient_clip_algorithm
-
+                gradient_clip_algorithm=self.cfg.train.manual_setting.gradient_clip_algorithm,
             )
-
-            # utils.clip_grad_norm_(self.params, max_norm, aggregate_norm_fn)
             self.clip_gradients(
                 optimizer=opt_hyp,
                 gradient_clip_val=self.glob_cfg.train.clip_grad,
-                gradient_clip_algorithm="norm"
+                gradient_clip_algorithm="norm",
             )
             opt_euc.step()
             opt_hyp.step()
@@ -696,25 +661,73 @@ class ManifoldFMLitModule(pl.LightningModule):
         if self.reconstruct_metrics is not None:
             for key, value in self.reconstruct_metrics.items():
                 if self.glob_cfg.dataset.name == "qm9":
-                    log_metric = log_metric * (2-torch.abs(torch.tensor(value, dtype=torch.float32,
-                                                 device=self.device)))
-                    log_metric_mean = log_metric_mean - torch.abs(torch.tensor(value, dtype=torch.float32,
-                                                 device=self.device))
+                    log_metric = log_metric * (
+                        2 - torch.abs(torch.tensor(value, dtype=torch.float32, device=self.device))
+                    )
+                    log_metric_mean = log_metric_mean - torch.abs(
+                        torch.tensor(value, dtype=torch.float32, device=self.device)
+                    )
                 else:
-                    log_metric = log_metric * torch.abs(torch.tensor(value, dtype=torch.float32,
-                                                 device=self.device))
-                    log_metric_mean = log_metric_mean + torch.abs(torch.tensor(value, dtype=torch.float32,
-                                                 device=self.device))
-        # qm9的情况下，是越大越好
+                    log_metric = log_metric * torch.abs(
+                        torch.tensor(value, dtype=torch.float32, device=self.device)
+                    )
+                    log_metric_mean = log_metric_mean + torch.abs(
+                        torch.tensor(value, dtype=torch.float32, device=self.device)
+                    )
 
-        return {
-            "loss": loss,
-            "log_metric": log_metric,
-            "log_metric_mean": log_metric_mean
-        }
+        return {"loss": loss, "log_metric": log_metric, "log_metric_mean": log_metric_mean}
 
+    def _get_condition(self, batch):
+        name = self.glob_cfg.dataset.name
+
+        if name == "qm9":
+            if (
+                self.condition_prop_idx is None
+                or self.dataset_bins is None
+                or not hasattr(batch, "y")
+                or batch.y is None
+            ):
+                return None
+
+            prop_vals = batch.y[:, self.condition_prop_idx].to(self.device)
+            num_bins  = self.dataset_bins.shape[0] + 1
+            condition = torch.bucketize(prop_vals, self.dataset_bins)
+            condition = condition.clamp(0, num_bins - 1)
+            return condition
+
+        elif name in ("geom", "drugs"):
+            if hasattr(batch, "y") and batch.y is not None:
+                y = batch.y
+                if y.dtype in (torch.long, torch.int):
+                    return y.view(-1).to(self.device)       # (B,) already integer
+                else:
+                    # Quantise a continuous property into cfg.num_classes bins
+                    num_bins = self.glob_cfg.dataset.get("num_classes", 10)
+                    bins = torch.linspace(y.min(), y.max(),
+                                        num_bins, device=self.device)
+                    return torch.bucketize(y.view(-1), bins) # (B,) ints
+
+        # ── SBM / Planar / Community (graph structure datasets) ───────────────
+        # These are often used without explicit class labels; you can condition
+        # on the graph size bucket instead.
+        elif name in ("sbm", "planar", "community"):
+            if hasattr(batch, "num_nodes"):
+                # Bucket graph sizes into, e.g., 5 bins
+                num_bins = self.glob_cfg.dataset.get("num_classes", 5)
+                n = batch.num_nodes.float().to(self.device)
+                bins = torch.linspace(n.min(), n.max(), num_bins, device=self.device)
+                return torch.bucketize(n, bins)             # (B,) ints
+
+        # ── Hyperbolic toy dataset ─────────────────────────────────────────────
+        elif name == "hyperbolic":
+            if isinstance(batch, dict) and "label" in batch:
+                return batch["label"].to(self.device)       # (B,) if provided
+
+        return None
+    
     def training_step(self, batch: Any, batch_idx: int):
-        loss_dict = self.loss_fn(batch)
+        condition = self._get_condition(batch)
+        loss_dict = self.loss_fn(batch, condition=condition)
 
         if torch.isfinite(loss_dict['loss']):
             # log train metrics
@@ -754,7 +767,9 @@ class ManifoldFMLitModule(pl.LightningModule):
         metrics = getattr(self, f"{stage}_metrics")
         out = {}
         if compute_loss:
-            loss_dict = self.loss_fn(batch)
+            condition = self._get_condition(batch)
+            loss_dict = self.loss_fn(batch, condition=condition)
+            
             for k, v in loss_dict.items():
                 self.log(
                     f"{stage}/{k}",
@@ -807,85 +822,51 @@ class ManifoldFMLitModule(pl.LightningModule):
 
     def compute_and_log_sampling_metrics(self, valid_result):
         dataset_name = self.glob_cfg.dataset.name
-        base_statistics = {'sbm': [0.0008, 0.0332, 0.0255], 'planar': [0.0002, 0.0310, 0.0005], 'community': [0.02, 0.07, 0.01]}
-        
-        # Check if we have base statistics for this dataset
-        if dataset_name in base_statistics:
-            base_statistics = base_statistics[dataset_name]
-            # Process datasets with base statistics for normalization
-            degree_dist, clustering_dist, orbit_dist = valid_result['degree'], valid_result['clustering'], valid_result['orbit']
-            degree_dist = degree_dist / base_statistics[0]
-            clustering_dist = clustering_dist / base_statistics[1]
-            orbit_dist = orbit_dist / base_statistics[2]
-            print('degree dist: {:.3f}'.format(degree_dist))
-            print('clustering dist: {:.3f}'.format(clustering_dist))
-            print('orbit dist: {:.3f}'.format(orbit_dist))
+        base_stats_map = {
+            'sbm':       [0.0008, 0.0332, 0.0255],
+            'planar':    [0.0002, 0.0310, 0.0005],
+            'community': [0.02,   0.07,   0.01  ],
+        }
 
-            print('Unique: {:.3f}'.format(valid_result['sampling/frac_unique']))
-            print('Unique&Novel: {:.3f}'.format(valid_result['sampling/frac_unique_non_iso']))
-            print('Valid&Unique&Novel: {:.3f}'.format(valid_result['sampling/frac_unic_non_iso_valid']))
+        if dataset_name in base_stats_map:
+            bs = base_stats_map[dataset_name]
+            degree_dist      = valid_result['degree']      / bs[0]
+            clustering_dist  = valid_result['clustering']  / bs[1]
+            orbit_dist       = valid_result['orbit']       / bs[2]
+            print(f"degree dist: {degree_dist:.3f}")
+            print(f"clustering dist: {clustering_dist:.3f}")
+            print(f"orbit dist: {orbit_dist:.3f}")
+            print(f"Unique: {valid_result['sampling/frac_unique']:.3f}")
+            print(f"Unique&Novel: {valid_result['sampling/frac_unique_non_iso']:.3f}")
+            print(f"Valid&Unique&Novel: {valid_result['sampling/frac_unic_non_iso_valid']:.3f}")
             print()
-                                       
-            valid_result["ratio_degree"] = degree_dist
-            valid_result["ratio_clustering"] = clustering_dist
-            valid_result["ratio_orbit_dist"] = orbit_dist
+            valid_result["ratio_degree"]       = degree_dist
+            valid_result["ratio_clustering"]   = clustering_dist
+            valid_result["ratio_orbit_dist"]   = orbit_dist
         else:
-            # For datasets without base statistics, log the raw metrics
+            # FIX: removed duplicated block that shadowed base_statistics
             print(f"No base statistics for {dataset_name}, using raw metrics")
-            
-            if 'degree' in valid_result:
-                print('Raw degree dist: {:.3f}'.format(valid_result['degree']))
-            if 'clustering' in valid_result:
-                print('Raw clustering dist: {:.3f}'.format(valid_result['clustering']))
-            if 'orbit' in valid_result:
-                print('Raw orbit dist: {:.3f}'.format(valid_result['orbit']))
-            
-            if 'sampling/frac_unique' in valid_result:
-                print('Unique: {:.3f}'.format(valid_result['sampling/frac_unique']))
-            if 'sampling/frac_unique_non_iso' in valid_result:
-                print('Unique&Novel: {:.3f}'.format(valid_result['sampling/frac_unique_non_iso']))
-            if 'sampling/frac_unic_non_iso_valid' in valid_result:
-                print('Valid&Unique&Novel: {:.3f}'.format(valid_result['sampling/frac_unic_non_iso_valid']))
+            for key in ('degree', 'clustering', 'orbit'):
+                if key in valid_result:
+                    print(f"Raw {key} dist: {valid_result[key]:.3f}")
+            for key in ('sampling/frac_unique', 'sampling/frac_unique_non_iso',
+                        'sampling/frac_unic_non_iso_valid'):
+                if key in valid_result:
+                    print(f"{key}: {valid_result[key]:.3f}")
             print()
 
-
-        abstract_dataset = ['sbm', 'planar', 'community']
-        
-        if dataset_name in abstract_dataset:
-            degree_dist, clustering_dist, orbit_dist = valid_result['degree'], valid_result['clustering'], valid_result['orbit']
-            degree_dist = degree_dist / base_statistics[0]
-            clustering_dist = clustering_dist / base_statistics[1]
-            orbit_dist = orbit_dist / base_statistics[2]
-            print('degree dist: {:.3f}'.format(degree_dist))
-            print('clustering dist: {:.3f}'.format(clustering_dist))
-            print('orbit dist: {:.3f}'.format(orbit_dist))
-
-            print('Unique: {:.3f}'.format(valid_result['sampling/frac_unique']))
-            print('Unique&Novel: {:.3f}'.format(valid_result['sampling/frac_unique_non_iso']))
-            print('Valid&Unique&Novel: {:.3f}'.format(valid_result['sampling/frac_unic_non_iso_valid']))
-            print()
-                                       
-            valid_result["ratio_degree"] = degree_dist
-            valid_result["ratio_clustering"] = clustering_dist
-            valid_result["ratio_orbit_dist"] = orbit_dist
-        
-
-        # 提取并打印指标
         for metric_name, value in valid_result.items():
-            print(f'{metric_name}: {value:.3f}')
-            # 使用 wandb 记录指标
-            self.log(f'sampling_metrics/{metric_name}', value, on_epoch=True, prog_bar=True)
+            print(f"{metric_name}: {value:.3f}")
+            self.log(f"sampling_metrics/{metric_name}", value, on_epoch=True, prog_bar=True)
 
 
     
     def on_validation_epoch_start(self):
         if self.val_counter == 0:
             val_loader = self.trainer.datamodule.val_dataloader()
-            # recon_samples = []
-            # get first batch
             for batch in val_loader:
                 self.VAE.test_interpolate(batch)
-            pdb.set_trace()
+
             start = time.time()
             samples_left_to_generate = self.glob_cfg.general.samples_to_generate
             samples = []
@@ -893,15 +874,23 @@ class ManifoldFMLitModule(pl.LightningModule):
             while samples_left_to_generate > 0:
                 bs = self.glob_cfg.flow_train.batch_size.val
                 to_generate = min(samples_left_to_generate, bs)
-                graph_list, graph_list_argmax = self.sample_decode(n_samples=to_generate, stage="valid")
+                graph_list, graph_list_argmax = self.sample_decode(
+                    n_samples=to_generate, stage="valid"
+                )
                 samples.extend(graph_list)
                 samples_argmax.extend(graph_list_argmax)
                 samples_left_to_generate -= to_generate
-            
+
             self.sampling_metrics.reset()
-            self.reconstruct_metrics = self.sampling_metrics(samples, self.name, self.current_epoch, val_counter=-1, test=False, local_rank=self.local_rank, extra_name='softmax')
+            self.reconstruct_metrics = self.sampling_metrics(
+                samples, self.name, self.current_epoch,
+                val_counter=-1, test=False, local_rank=self.local_rank, extra_name='softmax'
+            )
             self.sampling_metrics.reset()
-            self.reconstruct_metrics_argmax = self.sampling_metrics(samples_argmax, self.name, self.current_epoch, val_counter=-1, test=False, local_rank=self.local_rank, extra_name='argmax')
+            self.reconstruct_metrics_argmax = self.sampling_metrics(
+                samples_argmax, self.name, self.current_epoch,
+                val_counter=-1, test=False, local_rank=self.local_rank, extra_name='argmax'
+            )
             self.sampling_metrics.reset()
 
     def on_validation_epoch_end(self):
@@ -1171,8 +1160,7 @@ def check_latent_feature():
     #     import pdb; pdb.set_trace()
 
     return NotImplementedError
-
-
+        
 def debug_u_and_x():
     # 调试输入张量 x0 和 x1 的统计信息
     # print("x0[0][0].sum():", x0[0][0].sum().item())  # x0 第一个样本第一个节点所有元素的和

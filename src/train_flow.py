@@ -173,7 +173,22 @@ def main(cfg: DictConfig):
             
             test_smiles = qm9_dataset.get_test_smiles(cfg=glob_cfg, test_dataloader=datamodule.test_dataloader(),
                                                         dataset_infos=dataset_infos, evaluate_dataset=False)
-        
+            # Currently, bins/classes are based on one feature
+            PROP_INDICES = {'mu': 0, 'alpha': 1, 'homo': 2, 'lumo': 3}
+            condition_prop = glob_cfg.dataset.get('condition_property', 'gap')
+            prop_idx       = PROP_INDICES[condition_prop]
+            num_bins       = glob_cfg.dataset.get('num_classes', 10)
+            all_prop_vals = []
+            for batch in datamodule.train_dataloader():
+                all_prop_vals.append(batch.y[:, prop_idx])
+            all_prop_vals = torch.cat(all_prop_vals)
+
+            quantiles  = torch.linspace(0, 1, num_bins + 1)
+            bin_edges  = torch.quantile(all_prop_vals, quantiles)[1:-1]
+            dataset_bins = bin_edges
+            cond_kwargs = {"dataset_bins": dataset_bins, "condition_prop_idx": prop_idx}
+
+            
         elif dataset_config['name'] == 'guacamol':
             from datasets import guacamol_dataset
             datamodule = guacamol_dataset.GuacamolDataModule(glob_cfg)
@@ -246,7 +261,7 @@ def main(cfg: DictConfig):
 
     get_model = ManifoldFMLitModule
     hydra.utils.log.info(f"Instantiating <{get_model}>")
-    model = get_model(cfg, sampling_metrics, glob_cfg)
+    model = get_model(cfg, sampling_metrics, glob_cfg, **cond_kwargs)
 
     # Instantiate the callbacks
     callbacks: List[Callback] = build_callbacks(cfg=cfg)
