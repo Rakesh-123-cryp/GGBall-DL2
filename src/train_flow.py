@@ -174,7 +174,7 @@ def main(cfg: DictConfig):
             test_smiles = qm9_dataset.get_test_smiles(cfg=glob_cfg, test_dataloader=datamodule.test_dataloader(),
                                                         dataset_infos=dataset_infos, evaluate_dataset=False)
             # Currently, bins/classes are based on one feature
-            PROP_INDICES = {'mu': 0, 'alpha': 1, 'homo': 2, 'lumo': 3}
+            PROP_INDICES = {'mu': 0, 'alpha': 1, 'homo': 2, 'lumo': 3, 'gap': 4}
             condition_prop = glob_cfg.dataset.get('condition_property', 'gap')
             prop_idx       = PROP_INDICES[condition_prop]
             num_bins       = glob_cfg.dataset.get('num_classes', 10)

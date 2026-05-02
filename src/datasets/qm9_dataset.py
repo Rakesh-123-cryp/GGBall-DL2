@@ -169,7 +169,8 @@ class QM9Dataset(InMemoryDataset):
             edge_attr = edge_attr[perm]
 
             x = F.one_hot(torch.tensor(type_idx), num_classes=len(types)).float()
-            y = torch.zeros((1, 0), dtype=torch.float)
+            # y = torch.zeros((1, 0), dtype=torch.float)
+            y = torch.tensor(target_df.loc[i].values, dtype=torch.float).unsqueeze(0)
 
             if self.remove_h:
                 type_idx = torch.tensor(type_idx).long()
@@ -230,20 +231,21 @@ class QM9DataModule(MolecularDataModule):
         #                         target_prop=target, transform=RemoveYTransform()),
         #     'test': QM9Dataset(stage='test', root=root_path, remove_h=cfg.dataset.remove_h,
         #                         target_prop=target, transform=transform)}
-        if self.debug:
+        
+        if self.debug: ## transform was RemoveYTranform
             from torch.utils.data import Subset
             self.datasets = {
                 'train': Subset(QM9Dataset(stage='train', root=root_path, remove_h=cfg.dataset.remove_h,
-                                                target_prop=target, transform=RemoveYTransform()), list(range(1))),
+                                                target_prop=target, transform=None), list(range(1))),
                 'val': Subset(QM9Dataset(stage='val', root=root_path, remove_h=cfg.dataset.remove_h,
-                                            target_prop=target, transform=RemoveYTransform()), list(range(1))),
+                                            target_prop=target, transform=None), list(range(1))),
                 'test': Subset(QM9Dataset(stage='test', root=root_path, remove_h=cfg.dataset.remove_h,
                                             target_prop=target, transform=transform), list(range(1)))}
         else:
             self.datasets = {'train': QM9Dataset(stage='train', root=root_path, remove_h=cfg.dataset.remove_h,
-                                            target_prop=target, transform=RemoveYTransform()),
+                                            target_prop=target, transform=None),
                         'val': QM9Dataset(stage='val', root=root_path, remove_h=cfg.dataset.remove_h,
-                                        target_prop=target, transform=RemoveYTransform()),
+                                        target_prop=target, transform=None),
                         'test': QM9Dataset(stage='test', root=root_path, remove_h=cfg.dataset.remove_h,
                                         target_prop=target, transform=transform)}
         super().__init__(cfg, self.datasets)
