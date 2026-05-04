@@ -225,7 +225,96 @@ def main(cfg: DictConfig):
         model_kwargs = {'dataset_infos': dataset_infos, 'train_metrics': train_metrics,
                         'sampling_metrics': sampling_metrics, 'visualization_tools': visualization_tools,
                         'extra_features': extra_features, 'domain_features': domain_features}
-    
+        
+        
+    elif dataset_config["name"] == 'ba_graph':
+        from datasets.ba_graph_dataset import BAGraphDataset, BAGraphDataModule, BAGraphDatasetInfos
+        from analysis.spectre_utils import BAGraphSamplingMetrics
+        from analysis.visualization import NonMolecularVisualization
+
+        ## TODO: Update the config file with the following dataset settings
+        # dataset:
+        #     name: ba_graph
+        #     root: data/ba_graph
+        #     num_graphs: 10000
+        #     num_nodes: 50
+        #     num_edges: 2
+        #     metrics:
+        #         - clustering_coefficient
+        #         - diameter
+        #     num_classes:
+        #         clustering_coefficient: 5
+        #         diameter: 4
+        #     condition_property: clustering_coefficient  # primary metric for cond_kwargs
+        #     seed: 42
+        
+        metrics      = list(glob_cfg.dataset.get('metrics', ['clustering_coefficient']))
+        num_classes  = glob_cfg.dataset.get('num_classes', 5)   # int or DictConfig
+        if hasattr(num_classes, 'keys'):                        # OmegaConf DictConfig → plain dict
+            num_classes = dict(num_classes)
+ 
+        datamodule = BAGraphDataModule(
+            cfg=glob_cfg,
+            num_graphs=glob_cfg.dataset.get('num_graphs', 10000),
+            num_nodes=glob_cfg.dataset.get('num_nodes', 50),
+            num_edges=glob_cfg.dataset.get('num_edges', 2),
+            metrics=metrics,
+            num_classes=num_classes,
+            seed=glob_cfg.dataset.get('seed', 42),
+        )
+ 
+        dataset_infos = BAGraphDatasetInfos(datamodule=datamodule, cfg=glob_cfg)
+        train_metrics = TrainAbstractMetricsDiscrete() if glob_cfg.model.type == 'HGVAE' else TrainAbstractMetrics()
+        sampling_metrics = BAGraphSamplingMetrics(datamodule)
+        visualization_tools = NonMolecularVisualization()
+ 
+        if glob_cfg.model.type == 'HGVAE' and glob_cfg.model.extra_features is not None:
+            extra_features = ExtraFeatures(glob_cfg.model.extra_features, dataset_info=dataset_infos)
+        else:
+            extra_features = DummyExtraFeatures()
+        domain_features = DummyExtraFeatures()
+ 
+        dataset_infos.compute_input_output_dims(
+            datamodule=datamodule,
+            extra_features=extra_features,
+            domain_features=domain_features,
+        )
+ 
+        condition_prop = glob_cfg.dataset.get('condition_property', metrics[0])
+        if condition_prop not in metrics:
+            raise ValueError(
+                f"condition_property '{condition_prop}' is not in metrics {metrics}. "
+                "Add it to dataset.metrics or change condition_property."
+            )
+        prop_idx = metrics.index(condition_prop)   # column index in data.y
+ 
+        # Bin edges are already computed inside BAGraphDataset; retrieve them
+        # from the underlying train dataset via the datamodule.
+        train_dataset   = datamodule.train_dataset          # BAGraphDataset instance
+        raw_bin_edges   = train_dataset.bin_edges[condition_prop]   # np.ndarray, shape [num_bins+1]
+        # Drop outer boundary edges → interior edges only, matching QM9 convention
+        interior_edges  = torch.tensor(raw_bin_edges[1:-1], dtype=torch.float)
+        dataset_bins    = interior_edges
+ 
+        cond_kwargs = {
+            "dataset_bins":        dataset_bins,   # 1-D tensor of interior bin edges
+            "condition_prop_idx":  prop_idx,        # which column of data.y to condition on
+        }
+ 
+        hydra.utils.log.info(
+            f"BA graph conditioning on '{condition_prop}' "
+            f"(metric index {prop_idx}) with {len(dataset_bins)+1} bins."
+        )
+ 
+        model_kwargs = {
+            'dataset_infos':      dataset_infos,
+            'train_metrics':      train_metrics,
+            'sampling_metrics':   sampling_metrics,
+            'visualization_tools': visualization_tools,
+            'extra_features':     extra_features,
+            'domain_features':    domain_features,
+        }
+        
     elif dataset_config["name"] in ['hyperbolic']:
         if dataset_config["name"] == 'hyperbolic':
             from datasets import hyp_dataset
@@ -251,7 +340,6 @@ def main(cfg: DictConfig):
             model_kwargs = {'dataset_infos': dataset_infos, 'train_metrics': train_metrics,
                             'sampling_metrics': sampling_metrics, 'visualization_tools': visualization_tools,
                             'extra_features': extra_features, 'domain_features': domain_features}
-
 
     else:
         raise NotImplementedError("Unknown dataset {}".format(glob_cfg["dataset"]))
