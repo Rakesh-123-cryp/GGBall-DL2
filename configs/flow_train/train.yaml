@@ -1,5 +1,5 @@
-data: hyperbolic
-use_wandb: true
+data: ba_graph
+use_wandb: false
 test_only: false
 
 AR_sample:
@@ -161,7 +161,7 @@ local_coords: True
 lightning_module:
   module_class: HypeFlow # specify the PyTorch Lightning module class
 
-VAE_checkpoint: None
-Flow_checkpoint: None
+VAE_checkpoint: null
+Flow_checkpoint: null
 
 source_distribution: set1-0.04 

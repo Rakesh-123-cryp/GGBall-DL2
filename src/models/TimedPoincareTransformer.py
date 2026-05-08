@@ -180,6 +180,8 @@ class TimedPoincareTransformerLayer(nn.Module):
     def forward(self, x, t_emb, mask=None):
         # Get modulation parameters
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(t_emb).chunk(6, dim=-1)
+
+        # print(f"Updated size: {shift_msa.shape}")
         # TODO：不同位置的x的shift_msa应该是不同的？
         # Self-attention block with AdaLN
         residual = x
@@ -481,11 +483,11 @@ class TimedPoincareTransformer(nn.Module):
             mask:      (B, N) node mask
         """
         # ── Time embedding ────────────────────────────────────────────────────
-        t_emb = self.t_embedder(t)                     # (B, D)
-
+        t_emb = self.t_embedder(t)                     # (B, 1, D)
+        
         if self.class_embedder is not None and condition is not None:
             c_emb = self.class_embedder(condition,
-                                        train=self.training)  # (B, D)
+                                        train=self.training).unsqueeze(1)  # (B, 1, D)
             t_emb = t_emb + c_emb
         # If condition is None we fall back to unconditional behaviour
 

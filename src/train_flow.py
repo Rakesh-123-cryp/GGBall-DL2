@@ -175,7 +175,7 @@ def main(cfg: DictConfig):
                                                         dataset_infos=dataset_infos, evaluate_dataset=False)
             # Currently, bins/classes are based on one feature
             PROP_INDICES = {'mu': 0, 'alpha': 1, 'homo': 2, 'lumo': 3, 'gap': 4}
-            condition_prop = glob_cfg.dataset.get('condition_property', 'gap')
+            condition_prop = glob_cfg.dataset.get('condition_property', 'mu')
             prop_idx       = PROP_INDICES[condition_prop]
             num_bins       = glob_cfg.dataset.get('num_classes', 10)
             all_prop_vals = []
@@ -310,7 +310,7 @@ def main(cfg: DictConfig):
             'dataset_infos':      dataset_infos,
             'train_metrics':      train_metrics,
             'sampling_metrics':   sampling_metrics,
-            'visualization_tools': visualization_tools,
+            'visualization_tools': None, #visualization_tools,
             'extra_features':     extra_features,
             'domain_features':    domain_features,
         }

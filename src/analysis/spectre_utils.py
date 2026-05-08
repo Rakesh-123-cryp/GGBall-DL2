@@ -890,11 +890,11 @@ class SpectreSamplingMetrics(nn.Module):
             to_log.update({"epoch": epoch})
             wandb.log(to_log, commit=False)
             
-        if not test:
-            return {"negative_valid_orbit": - to_log['orbit_valid'],
-                    "negative_valid_degree":  - to_log['degree_valid'],
-                    "negative_valid_clustering":  - to_log['clustering_valid']}
-        # return to_log
+        # if not test:
+        #     return {"negative_valid_orbit": - to_log['orbit_valid'],
+        #             "negative_valid_degree":  - to_log['degree_valid'],
+        #             "negative_valid_clustering":  - to_log['clustering_valid']}
+        return to_log
 
     def reset(self):
         pass
@@ -937,3 +937,200 @@ class EgoSmallSamplingMetrics(SpectreSamplingMetrics):
 class HyperbolicSamplingMetrics():
     def __init__(self, datamodule):
         self.datamodule = datamodule
+        
+def _fit_powerlaw_r2(G: nx.Graph) -> float:
+    """
+    Fit log(count) ~ slope * log(degree) on the non-zero part of the
+    degree histogram and return the R² of that linear fit.
+    A high R² (close to 1) means the degree distribution is power-law-like.
+    """
+    hist = np.array(nx.degree_histogram(G), dtype=float)
+    degrees = np.nonzero(hist)[0]
+    if len(degrees) < 3:          # too few distinct degrees to fit
+        return 0.0
+    counts = hist[degrees]
+
+    log_d = np.log(degrees.astype(float))
+    log_c = np.log(counts)
+
+    # Ordinary least-squares on the log-log data
+    A = np.vstack([log_d, np.ones(len(log_d))]).T
+    slope, intercept = np.linalg.lstsq(A, log_c, rcond=None)[0]
+    residuals = log_c - (slope * log_d + intercept)
+    ss_res = np.dot(residuals, residuals)
+    ss_tot = np.var(log_c) * len(log_c)
+    return float(1.0 - ss_res / (ss_tot + 1e-10))
+
+
+def _compute_metric_value(G: nx.Graph, metric: str) -> float:
+    """Mirror of BAGraphDataset._compute_metric for use at eval time."""
+    if metric == "clustering_coefficient":
+        return nx.average_clustering(G)
+    elif metric == "diameter":
+        if not nx.is_connected(G):
+            largest_cc = max(nx.connected_components(G), key=len)
+            return float(nx.diameter(G.subgraph(largest_cc)))
+        return float(nx.diameter(G))
+    elif metric == "avg_degree":
+        return float(np.mean([d for _, d in G.degree()]))
+    elif metric == "density":
+        return nx.density(G)
+    elif metric == "transitivity":
+        return nx.transitivity(G)
+    else:
+        raise ValueError(f"Unknown metric '{metric}'")
+
+
+def _assign_bin(value: float, edges: np.ndarray) -> int:
+    """Return 0-based bin index for *value* given bin *edges* array."""
+    idx = int(np.searchsorted(edges[1:], value))
+    return min(idx, len(edges) - 2)
+
+
+class BAGraphSamplingMetrics(SpectreSamplingMetrics):
+    """
+    Sampling metrics for BAGraphDataset / BAGraphDataModule.
+
+    Parameters
+    ----------
+    datamodule : BAGraphDataModule
+        Must expose `.bin_edges` (dict metric→np.ndarray) and
+        `.metric_names` (list[str]) on its underlying BAGraphDataset.
+    pl_r2_threshold : float
+        Minimum R² on the log-log degree fit to call a graph "valid BA".
+    compute_emd : bool
+        Passed through to SpectreSamplingMetrics.
+    """
+
+    def __init__(
+        self,
+        datamodule,
+        pl_r2_threshold: float = 0.85,
+        compute_emd: bool = False,
+    ):
+        # BA graphs are general graphs; use the same MMD metrics as Comm20
+        # (degree + clustering + orbit).  Add 'spectre' if you want eigenvalue
+        # stats too — it is just slower.
+        super().__init__(
+            datamodule=datamodule,
+            compute_emd=compute_emd,
+            metrics_list=['degree', 'clustering', 'orbit', 'spectre'],
+        )
+        self.pl_r2_threshold = pl_r2_threshold
+
+        # Conditioning info – may be absent if the datamodule is the plain
+        # Spectre-style module without binning support.
+        self.metric_names: list = getattr(datamodule, 'metric_names', [])
+        self.bin_edges: dict  = getattr(datamodule, 'bin_edges',  {})
+
+    def forward(
+        self,
+        generated_graphs: list,
+        name,
+        current_epoch,
+        val_counter,
+        local_rank,
+        test=False,
+        extra_name='',
+        # Optional: list of integer bin-label tensors (data.y) that were
+        # used to condition the model, one per generated graph.
+        condition_labels=None,
+    ):
+        # ---- Run the inherited MMD metrics (degree / clustering / orbit / spectre) ----
+        to_log = {}
+        stage = ('test' if test else 'valid') + extra_name
+
+        # Rebuild networkx graphs from the generated (node_types, edge_types) tuples
+        networkx_graphs = []
+        for graph in generated_graphs:
+            node_types, edge_types = graph
+            A = edge_types.bool().cpu().numpy()
+            nx_graph = nx.from_numpy_array(A)
+            networkx_graphs.append(nx_graph)
+
+        # Call parent – it will redo the nx conversion internally, which is a
+        # minor redundancy but keeps the parent code untouched.
+        parent_log = super().forward(
+            generated_graphs, name, current_epoch, val_counter,
+            local_rank, test=test, extra_name=extra_name,
+        )
+
+        # ---- 1. Power-law validity ----
+        r2_scores = [_fit_powerlaw_r2(G) for G in networkx_graphs]
+        valid_ba  = [r2 >= self.pl_r2_threshold for r2 in r2_scores]
+        ba_validity = float(np.mean(valid_ba))
+
+        to_log[f'ba_validity_{stage}']    = ba_validity
+        to_log[f'ba_mean_pl_r2_{stage}']  = float(np.mean(r2_scores))
+
+        if local_rank == 0:
+            print(f"BA validity (R²≥{self.pl_r2_threshold}): {ba_validity:.4f}  "
+                  f"mean R²={np.mean(r2_scores):.4f}")
+        if wandb.run:
+            wandb.run.summary[f'ba_validity_{stage}'] = ba_validity
+
+        # ---- 2. Conditional accuracy (per metric) ----
+        if condition_labels is not None and len(self.metric_names) > 0:
+            # condition_labels: list of tensors shape [1, M] or [M]
+            labels_array = torch.stack(
+                [lbl.view(-1) for lbl in condition_labels]
+            ).numpy()   # shape [N, M]
+
+            for m_idx, metric in enumerate(self.metric_names):
+                if metric not in self.bin_edges:
+                    continue
+
+                edges = self.bin_edges[metric]        # np.ndarray shape [K+1]
+                correct = 0
+                metric_vals = []
+
+                for i, G in enumerate(networkx_graphs):
+                    try:
+                        val   = _compute_metric_value(G, metric)
+                        pred_bin = _assign_bin(val, edges)
+                        true_bin = int(labels_array[i, m_idx])
+                        if pred_bin == true_bin:
+                            correct += 1
+                        metric_vals.append(val)
+                    except Exception:
+                        metric_vals.append(float('nan'))
+
+                cond_acc  = correct / max(len(networkx_graphs), 1)
+                mean_val  = float(np.nanmean(metric_vals))
+
+                to_log[f'cond_acc_{metric}_{stage}']  = cond_acc
+                to_log[f'mean_{metric}_{stage}']       = mean_val
+
+                if local_rank == 0:
+                    print(f"  Conditional accuracy [{metric}]: {cond_acc:.4f}  "
+                          f"mean generated value: {mean_val:.4f}")
+                if wandb.run:
+                    wandb.run.summary[f'cond_acc_{metric}_{stage}'] = cond_acc
+
+        # ---- Merge and log ----
+        if wandb.run:
+            epoch = wandb.run.summary.get("epoch", 0)
+            to_log.update({"epoch": epoch})
+            wandb.log(to_log, commit=False)
+
+        if local_rank == 0:
+            print("BA sampling statistics:", to_log)
+
+        # Return the same dict shape the training loop expects, extended with
+        # BA-specific keys so they can be used as early-stopping signals.
+        result = {}
+        if parent_log:
+            result.update(parent_log)
+        result.update({
+            f'ba_validity_{stage}': ba_validity,
+        })
+        if condition_labels is not None:
+            for metric in self.metric_names:
+                key = f'cond_acc_{metric}_{stage}'
+                if key in to_log:
+                    result[key] = to_log[key]
+
+        return result
+
+    def reset(self):
+        pass

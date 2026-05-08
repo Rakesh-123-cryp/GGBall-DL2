@@ -361,7 +361,7 @@ class HGVAE(pl.LightningModule):
                 '/home/crwang/code/graph-generation/HypeFlow/data/interpolate/',
                 f'graphs/{self.name}/strips_ckpt2/interpolate_train_batch_index_{batch_index}_random_{random_start.item()}_{random_end.item()}_argmax/'
             )
-            self.visualization_tools.visualize_interpolation_strip2(molecule_list, result_path, log_tag="interpolate_qm9")
+            # self.visualization_tools.visualize_interpolation_strip2(molecule_list, result_path, log_tag="interpolate_qm9")
             # pdb.set_trace()
             
             # # Only once after full pass
@@ -1381,7 +1381,7 @@ class HGVAE(pl.LightningModule):
                 current_path,
                 f'graphs/{self.name}/reconstruct_epoch_{self.current_epoch}/'
             )
-            self.visualization_tools.visualize(result_path, recon_samples, min(len(recon_samples), 512), "reconstruct_graph")
+            # self.visualization_tools.visualize(result_path, recon_samples, min(len(recon_samples), 512), "reconstruct_graph")
             self.print("Visualization complete.")
 
 
@@ -1451,7 +1451,7 @@ class HGVAE(pl.LightningModule):
                 current_path,
                 f'graphs/{self.name}/reconstruct_epoch_{self.current_epoch}/'
             )
-            self.visualization_tools.visualize(result_path, recon_samples, min(len(recon_samples), 512), "reconstruct_graph")
+            # self.visualization_tools.visualize(result_path, recon_samples, min(len(recon_samples), 512), "reconstruct_graph")
             self.print("Visualization complete.")
 
             # === 4. 送入同一个评估模块 ===
@@ -1507,7 +1507,7 @@ class HGVAE(pl.LightningModule):
                 current_path,
                 f'graphs/{self.name}/train_data_first_batch/'
             )
-            self.visualization_tools.visualize(result_path, molecule_list, batch_size)
+            # self.visualization_tools.visualize(result_path, molecule_list, batch_size)
             self.print("Visualization complete.")
 
     def on_test_epoch_end(self):

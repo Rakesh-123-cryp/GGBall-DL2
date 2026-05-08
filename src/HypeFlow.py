@@ -106,6 +106,11 @@ class ManifoldFMLitModule(pl.LightningModule):
             from .models.hyperbolic_nn_plusplus.geoopt_plusplus.manifolds import PoincareBall
 
             num_classes  = getattr(self.glob_cfg.dataset, 'num_classes',  0)
+            from omegaconf import DictConfig
+            if isinstance(num_classes, DictConfig):
+                metric = getattr(self.glob_cfg.dataset, 'metrics', ['clustering_coefficient'])[0]
+                num_classes = num_classes.get(metric, 5)
+                
             cfg_dropout  = getattr(self.glob_cfg.model,   'cfg_dropout',  0.1)
 
             self.model = TimedPoincareTransformer(
@@ -305,19 +310,44 @@ class ManifoldFMLitModule(pl.LightningModule):
         return self.manifold.dist(x0, x1)
 
     @torch.no_grad()
-    def sample_decode(self, n_samples, x0=None, stage="valid"):
-        x1, node_mask = self.sample(n_samples, x0)
+    def sample_decode(self, n_samples, x0=None, stage="valid", condition=None):
+        """
+        condition: optional long tensor [n_samples] of class indices.
+        If None and dataset is conditional, samples uniformly across all classes.
+        """
+        # If no condition provided for a conditional dataset, sample class labels uniformly
+        if condition is None and self.glob_cfg.dataset.name == "ba_graph":
+            if self.condition_prop_idx is not None:
+                # Get num_classes for the conditioned metric
+                num_classes_cfg = self.glob_cfg.dataset.get('num_classes', 5)
+                from omegaconf import DictConfig
+                if isinstance(num_classes_cfg, DictConfig):
+                    metrics = list(self.glob_cfg.dataset.get('metrics', ['clustering_coefficient']))
+                    metric  = metrics[self.condition_prop_idx]
+                    num_classes = num_classes_cfg.get(metric, 5)
+                else:
+                    num_classes = int(num_classes_cfg)
+                # Sample uniformly from all class bins
+                condition = torch.randint(
+                    0, num_classes, (n_samples,), device=self.device
+                )
+
+        elif condition is None and self.glob_cfg.dataset.name == "qm9":
+            if self.condition_prop_idx is not None and self.dataset_bins is not None:
+                num_bins = self.dataset_bins.shape[0] + 1
+                condition = torch.randint(0, num_bins, (n_samples,), device=self.device)
+
+        x1, node_mask = self.sample(n_samples, x0, condition=condition)
         graph_list, graph_list_argmax = self.VAE.generate_sample_from_z(x1, node_mask)
-                
-        # Only once after full pass
+
         current_path = os.getcwd()
         result_path = os.path.join(
             current_path,
             f'graphs/{self.name}/epoch{self.current_epoch}/'
         )
-        self.VAE.visualization_tools.visualize(result_path, graph_list, n_samples)
+        # self.VAE.visualization_tools.visualize(result_path, graph_list, n_samples)
         self.print("Visualization complete.")
-        
+
         return graph_list, graph_list_argmax
 
     @torch.no_grad()
@@ -351,19 +381,19 @@ class ManifoldFMLitModule(pl.LightningModule):
             )
 
         # Build the vector field (with or without CFG)
-        def effective_vecfield(t, x, **kwargs):
+        def effective_vecfield(t, x, effective_mask):
             if use_cfg:
                 # Conditional pass
-                v_cond = self.vecfield(t, x, condition=condition, mask=mask)
+                v_cond = self.vecfield(t, x, condition=condition, mask=effective_mask)
                 # Unconditional pass
-                v_uncond = self.vecfield(t, x, condition=null_condition, mask=mask)
+                v_uncond = self.vecfield(t, x, condition=null_condition, mask=effective_mask)
                 # CFG interpolation in tangent space at x
                 v_cond_tan = self.product_manifold.logmap(x, v_cond)
                 v_uncond_tan = self.product_manifold.logmap(x, v_uncond)
                 v_cfg_tan = v_uncond_tan + guidance_scale * (v_cond_tan - v_uncond_tan)
                 return self.product_manifold.expmap(x, v_cfg_tan)
             else:
-                return self.vecfield(t, x, condition=condition, mask=mask)
+                return self.vecfield(t, x, condition=condition, mask=effective_mask)
 
         local_coords = self.cfg.get("local_coords", False)
         eval_projx = self.cfg.get("eval_projx", False)
@@ -607,7 +637,42 @@ class ManifoldFMLitModule(pl.LightningModule):
             N = x1.shape[0]
             MAX_NODES = x1.shape[1]
             t = torch.rand(N).reshape(-1, 1).to(x1)
+            
+            def cond_u_batched(x0, x1, t):
+                """
+                x0, x1 : [N, MAX_NODES, channels]
+                t       : [N, 1]
+                Returns x_t, u_t : [N, MAX_NODES, channels]
+                """
+                N = x0.shape[0]
+                x_t_list, u_t_list = [], []
 
+                for i in range(N):
+                    x0_i = x0[i]                              # [MAX_NODES, channels]
+                    x1_i = x1[i]                              # [MAX_NODES, channels]
+
+                    sched_out  = self.scheduler(t[i])         # SchedulerOutput
+                    alpha_t    = sched_out.alpha_t            # scalar tensor
+                    d_alpha_t  = sched_out.d_alpha_t          # scalar tensor
+
+                    # Tangent vector from x0 toward x1 on the manifold
+                    log_i = self.product_manifold.logmap(x0_i, x1_i)   # [MAX_NODES, channels]
+
+                    # Geodesic point at time t
+                    x_t_i = self.product_manifold.expmap(x0_i, alpha_t * log_i)  # [MAX_NODES, channels]
+
+                    # Velocity: d/dt expmap(x0, alpha(t)*log(x0,x1)) = d_alpha_t * log(x0, x1)
+                    u_t_i = d_alpha_t * log_i                           # [MAX_NODES, channels]
+
+                    x_t_list.append(x_t_i)
+                    u_t_list.append(u_t_i)
+
+                return torch.stack(x_t_list), torch.stack(u_t_list)
+
+            x_t, u_t = cond_u_batched(x0, x1, t)
+            x_t = x_t.reshape(N, MAX_NODES, -1)
+            u_t = u_t.reshape(N, MAX_NODES, -1)
+            
             def cond_u(x0, x1, t):
                 path = geodesic(self.product_manifold, x0, x1)
                 x_t, u_t = jvp(
@@ -616,7 +681,7 @@ class ManifoldFMLitModule(pl.LightningModule):
                 )
                 return x_t, u_t
 
-            x_t, u_t = vmap(cond_u)(x0, x1, t)
+            x_t, u_t = cond_u_batched(x0, x1, t) #vmap(cond_u)(x0, x1, t)
             x_t = x_t.reshape(N, MAX_NODES, -1)
             u_t = u_t.reshape(N, MAX_NODES, -1)
             u_t = self.product_manifold.proju(x_t, u_t)
@@ -658,6 +723,7 @@ class ManifoldFMLitModule(pl.LightningModule):
 
         log_metric = loss.detach().item()
         log_metric_mean = 0
+        print("#######", self.reconstruct_metrics is None)
         if self.reconstruct_metrics is not None:
             for key, value in self.reconstruct_metrics.items():
                 if self.glob_cfg.dataset.name == "qm9":
@@ -694,7 +760,22 @@ class ManifoldFMLitModule(pl.LightningModule):
             condition = torch.bucketize(prop_vals, self.dataset_bins)
             condition = condition.clamp(0, num_bins - 1)
             return condition
-
+        
+        elif name == "ba_graph":
+            # batch.y is [B, M] long — bin indices, already discretised
+            if (
+                self.condition_prop_idx is None
+                or not hasattr(batch, "y")
+                or batch.y is None
+            ):
+                return None
+            # y is already integer bin labels; just pick the conditioned metric column
+            y = batch.y  # [B, M] or [B*1, M] depending on collation
+            if y.dim() == 3:
+                y = y.squeeze(1)  # [B, M]
+            condition = y[:, self.condition_prop_idx].to(self.device)  # [B]
+            return condition.long()
+    
         elif name in ("geom", "drugs"):
             if hasattr(batch, "y") and batch.y is not None:
                 y = batch.y
@@ -732,6 +813,7 @@ class ManifoldFMLitModule(pl.LightningModule):
         if torch.isfinite(loss_dict['loss']):
             # log train metrics
             for k, v in loss_dict.items():
+                print(k, type(v))
                 self.log(f"train/{k}", v, on_step=True, on_epoch=True, prog_bar=True)
                 self.train_metrics[k].update(v.cpu())
         else:
@@ -750,9 +832,13 @@ class ManifoldFMLitModule(pl.LightningModule):
         for train_metric in self.train_metrics.values():
             train_metric.reset()
 
-        sched_euc, sched_hyp = self.lr_schedulers()
-        sched_euc.step()
-        sched_hyp.step()
+        if self.use_riemannian_optimizer:
+            sched_euc, sched_hyp = self.lr_schedulers()
+            sched_euc.step()
+            sched_hyp.step()
+        else:
+            sched = self.lr_schedulers()
+            sched.step()
 
     def shared_eval_step(
         self,
@@ -869,13 +955,13 @@ class ManifoldFMLitModule(pl.LightningModule):
 
             start = time.time()
             samples_left_to_generate = self.glob_cfg.general.samples_to_generate
-            samples = []
-            samples_argmax = []
+            samples, samples_argmax = [], []
             while samples_left_to_generate > 0:
                 bs = self.glob_cfg.flow_train.batch_size.val
                 to_generate = min(samples_left_to_generate, bs)
+                # condition=None → sample_decode will sample classes uniformly
                 graph_list, graph_list_argmax = self.sample_decode(
-                    n_samples=to_generate, stage="valid"
+                    n_samples=to_generate, stage="valid", condition=None
                 )
                 samples.extend(graph_list)
                 samples_argmax.extend(graph_list_argmax)
@@ -920,7 +1006,7 @@ class ManifoldFMLitModule(pl.LightningModule):
             while samples_left_to_generate > 0:
                 bs = self.glob_cfg.flow_train.batch_size.val
                 to_generate = min(samples_left_to_generate, bs)
-                graph_list, graph_list_argmax = self.sample_decode(n_samples=to_generate, stage="test")
+                graph_list, graph_list_argmax = self.sample_decode(n_samples=to_generate, condition=None, stage="test")
                 samples.extend(graph_list)
                 samples_argmax.extend(graph_list_argmax)
                 samples_left_to_generate -= to_generate
@@ -957,7 +1043,7 @@ class ManifoldFMLitModule(pl.LightningModule):
         while samples_left_to_generate > 0:
             bs = 512
             to_generate = min(samples_left_to_generate, bs)
-            graph_list, graph_list_argmax = self.sample_decode(n_samples=to_generate, stage="test")
+            graph_list, graph_list_argmax = self.sample_decode(n_samples=to_generate, condition=None, stage="test")
             samples.extend(graph_list)
             samples_argmax.extend(graph_list_argmax)
             samples_left_to_generate -= to_generate
