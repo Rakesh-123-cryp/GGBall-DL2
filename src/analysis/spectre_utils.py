@@ -1056,18 +1056,18 @@ class BAGraphSamplingMetrics(SpectreSamplingMetrics):
         )
 
         # ---- 1. Power-law validity ----
-        r2_scores = [_fit_powerlaw_r2(G) for G in networkx_graphs]
-        valid_ba  = [r2 >= self.pl_r2_threshold for r2 in r2_scores]
-        ba_validity = float(np.mean(valid_ba))
+        # r2_scores = [_fit_powerlaw_r2(G) for G in networkx_graphs]
+        # valid_ba  = [r2 >= self.pl_r2_threshold for r2 in r2_scores]
+        # ba_validity = float(np.mean(valid_ba))
 
-        to_log[f'ba_validity_{stage}']    = ba_validity
-        to_log[f'ba_mean_pl_r2_{stage}']  = float(np.mean(r2_scores))
+        # to_log[f'ba_validity_{stage}']    = ba_validity
+        # to_log[f'ba_mean_pl_r2_{stage}']  = float(np.mean(r2_scores))
 
-        if local_rank == 0:
-            print(f"BA validity (R²≥{self.pl_r2_threshold}): {ba_validity:.4f}  "
-                  f"mean R²={np.mean(r2_scores):.4f}")
-        if wandb.run:
-            wandb.run.summary[f'ba_validity_{stage}'] = ba_validity
+        # if local_rank == 0:
+        #     print(f"BA validity (R²≥{self.pl_r2_threshold}): {ba_validity:.4f}  "
+        #           f"mean R²={np.mean(r2_scores):.4f}")
+        # if wandb.run:
+        #     wandb.run.summary[f'ba_validity_{stage}'] = ba_validity
 
         # ---- 2. Conditional accuracy (per metric) ----
         if condition_labels is not None and len(self.metric_names) > 0:
@@ -1121,9 +1121,9 @@ class BAGraphSamplingMetrics(SpectreSamplingMetrics):
         result = {}
         if parent_log:
             result.update(parent_log)
-        result.update({
-            f'ba_validity_{stage}': ba_validity,
-        })
+        # result.update({
+        #     f'ba_validity_{stage}': ba_validity,
+        # })
         if condition_labels is not None:
             for metric in self.metric_names:
                 key = f'cond_acc_{metric}_{stage}'

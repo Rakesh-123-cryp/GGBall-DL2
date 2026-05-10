@@ -1319,9 +1319,13 @@ class HGVAE(pl.LightningModule):
         
 
     def on_train_epoch_end(self) -> None:
-        sched_euc, sched_hyp = self.lr_schedulers()
-        sched_euc.step()
-        sched_hyp.step()
+        if self.use_riemannian_optimizer:
+            sched_euc, sched_hyp = self.lr_schedulers()
+            sched_euc.step()
+            sched_hyp.step()
+        else:
+            sched = self.lr_schedulers()
+            sched.step()
 
         to_log = self.train_loss.log_epoch_metrics()
         to_log["epoch"] = self.current_epoch

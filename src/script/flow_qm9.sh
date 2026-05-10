@@ -24,7 +24,7 @@ USE_KMEANS=True
 INTEGRATE_METHOD=vt_prediction
 
 TASK=flow
-VAE_MODEL_PATH="'/butianci/HypeFlow/src/outputs/epoch=3239-batch_loss=0.00.ckpt'"
+VAE_MODEL_PATH="'/home/scur0096/experiments/conditional/outputs/BA_VQVAE_256code_hyp128_euc0_pairwise_interactiondecode-ba_graph/VAE/2026-05-09/00-29-08/checkpoints/BA_VQVAE_256code_hyp128_euc0_pairwise_interactiondecode/epoch=669-batch_loss=0.00.ckpt'"
 # FLOW_MODEL_PATH="'/data/wangchuanrui/runs_graph/comm20_AE_32code_hyp64_euc0_decode_strong_mlp-comm20/flow/2025-05-02/14-01-07/every_n_epochs/epoch=39299-step=39300.ckpt'"
 FLOW_MODEL_PATH=None
 

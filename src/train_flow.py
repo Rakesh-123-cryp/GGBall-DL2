@@ -247,8 +247,7 @@ def main(cfg: DictConfig):
         #         diameter: 4
         #     condition_property: clustering_coefficient  # primary metric for cond_kwargs
         #     seed: 42
-        
-        metrics      = list(glob_cfg.dataset.get('metrics', ['clustering_coefficient']))
+        metrics = glob_cfg.dataset.get('metrics', None)
         num_classes  = glob_cfg.dataset.get('num_classes', 5)   # int or DictConfig
         if hasattr(num_classes, 'keys'):                        # OmegaConf DictConfig → plain dict
             num_classes = dict(num_classes)
@@ -260,18 +259,19 @@ def main(cfg: DictConfig):
             num_edges=glob_cfg.dataset.get('num_edges', 2),
             metrics=metrics,
             num_classes=num_classes,
-            seed=glob_cfg.dataset.get('seed', 42),
+            seed=glob_cfg.flow_train.train.random_seed,
         )
  
         dataset_infos = BAGraphDatasetInfos(datamodule=datamodule, cfg=glob_cfg)
         train_metrics = TrainAbstractMetricsDiscrete() if glob_cfg.model.type == 'HGVAE' else TrainAbstractMetrics()
-        sampling_metrics = BAGraphSamplingMetrics(datamodule)
+        sampling_metrics = BAGraphSamplingMetrics(           # FIX: pass config args
+            datamodule,
+            pl_r2_threshold=glob_cfg.dataset.get('pl_r2_threshold', 0.85),
+            compute_emd=glob_cfg.dataset.get('compute_emd', False),
+        )
         visualization_tools = NonMolecularVisualization()
  
-        if glob_cfg.model.type == 'HGVAE' and glob_cfg.model.extra_features is not None:
-            extra_features = ExtraFeatures(glob_cfg.model.extra_features, dataset_info=dataset_infos)
-        else:
-            extra_features = DummyExtraFeatures()
+        extra_features  = DummyExtraFeatures()
         domain_features = DummyExtraFeatures()
  
         dataset_infos.compute_input_output_dims(
@@ -310,7 +310,7 @@ def main(cfg: DictConfig):
             'dataset_infos':      dataset_infos,
             'train_metrics':      train_metrics,
             'sampling_metrics':   sampling_metrics,
-            'visualization_tools': None, #visualization_tools,
+            'visualization_tools': visualization_tools,
             'extra_features':     extra_features,
             'domain_features':    domain_features,
         }
